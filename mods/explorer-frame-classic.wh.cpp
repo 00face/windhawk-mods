@@ -2,7 +2,7 @@
 // @id              explorer-frame-classic
 // @name            Classic Explorer navigation bar
 // @description     Restores the classic Explorer navigation bar to the version before the Windows 11 "Moments 4" update
-// @version         1.0.6
+// @version         1.0.8
 // @author          m417z
 // @github          https://github.com/m417z
 // @twitter         https://twitter.com/m417z
@@ -69,6 +69,8 @@ enum class ExplorerStyle {
 struct {
     ExplorerStyle explorerStyle;
 } g_settings;
+
+std::atomic<bool> g_fileExplorerExtensionsLoaded;
 
 #pragma region WASDK
 namespace WASDK {
@@ -463,9 +465,12 @@ VS_FIXEDFILEINFO* GetModuleVersionInfo(HMODULE hModule, UINT* puPtrLen) {
     return (VS_FIXEDFILEINFO*)pFixedFileInfo;
 }
 
-bool IsVersionAtLeast(WORD major, WORD minor, WORD build, WORD qfe) {
-    static VS_FIXEDFILEINFO* fixedFileInfo =
-        GetModuleVersionInfo(nullptr, nullptr);
+bool IsVersionAtLeast(HMODULE hModule,
+                      WORD major,
+                      WORD minor,
+                      WORD build,
+                      WORD qfe) {
+    VS_FIXEDFILEINFO* fixedFileInfo = GetModuleVersionInfo(hModule, nullptr);
     if (!fixedFileInfo) {
         return false;
     }
@@ -488,6 +493,22 @@ bool IsVersionAtLeast(WORD major, WORD minor, WORD build, WORD qfe) {
     }
 
     return moduleQfe >= qfe;
+}
+
+bool IsExplorerVersionAtLeast(WORD major, WORD minor, WORD build, WORD qfe) {
+    return IsVersionAtLeast(nullptr, major, minor, build, qfe);
+}
+
+bool IsFileExplorerExtensionsVersionAtLeast(WORD major,
+                                            WORD minor,
+                                            WORD build,
+                                            WORD qfe) {
+    HMODULE hModule = GetModuleHandle(L"FileExplorerExtensions.dll");
+    if (!hModule) {
+        return false;
+    }
+
+    return IsVersionAtLeast(hModule, major, minor, build, qfe);
 }
 
 std::optional<bool> IsOsFeatureEnabled(UINT32 featureId) {
@@ -627,7 +648,11 @@ HRESULT WINAPI Feature_NavigationBarControl_OnApplyTemplate_Hook(PVOID pThis) {
     Wh_Log(L">");
 
     if (g_settings.explorerStyle == ExplorerStyle::classicNavigationBar) {
-        HandleNavigationBarControl(*(IUnknown**)((BYTE*)pThis + 0x08));
+        static size_t offset =
+            IsFileExplorerExtensionsVersionAtLeast(2125, 4200, 50, 0) ? 0x40
+                                                                      : 0x08;
+
+        HandleNavigationBarControl(*(IUnknown**)((BYTE*)pThis + offset));
     }
 
     return Feature_NavigationBarControl_OnApplyTemplate_Original(pThis);
@@ -648,7 +673,7 @@ int WINAPI CommandBarExtension_GetHeight_Hook(
 
     if (g_settings.explorerStyle == ExplorerStyle::classicNavigationBar) {
         static const float newHeight =
-            IsVersionAtLeast(10, 0, 22621, 3958) ? 0 : 6;
+            IsExplorerVersionAtLeast(10, 0, 22621, 3958) ? 0 : 6;
         sizeOut->Height = newHeight;
     }
 
@@ -707,7 +732,8 @@ HRESULT WINAPI CoCreateInstance_Hook(REFCLSID rclsid,
 }
 
 bool HookExplorerFrameSymbols() {
-    HMODULE module = LoadLibrary(L"explorerframe.dll");
+    HMODULE module = LoadLibraryEx(L"explorerframe.dll", nullptr,
+                                   LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!module) {
         Wh_Log(L"Couldn't load explorerframe.dll");
         return false;
@@ -716,29 +742,34 @@ bool HookExplorerFrameSymbols() {
     WindhawkUtils::SYMBOL_HOOK explorerFrameDllHooks[] = {
         {
             {LR"(bool __cdecl CanShowModernNavBar(void))"},
-            (void**)&CanShowModernNavBar_Original,
-            (void*)CanShowModernNavBar_Hook,
+            &CanShowModernNavBar_Original,
+            CanShowModernNavBar_Hook,
             true,  // Before Win11 24H2.
         },
         {
             {LR"(public: static bool __cdecl CachedExplorerExtensionState::IsModernNavBarAvailable(void))"},
-            (void**)&CachedExplorerExtensionState_IsModernNavBarAvailable_Original,
-            (void*)CachedExplorerExtensionState_IsModernNavBarAvailable_Hook,
+            &CachedExplorerExtensionState_IsModernNavBarAvailable_Original,
+            CachedExplorerExtensionState_IsModernNavBarAvailable_Hook,
             true,  // Since Win11 24H2.
         },
     };
 
-    return HookSymbols(module, explorerFrameDllHooks,
-                       ARRAYSIZE(explorerFrameDllHooks));
+    if (!HookSymbols(module, explorerFrameDllHooks,
+                     ARRAYSIZE(explorerFrameDllHooks))) {
+        Wh_Log(L"HookSymbols failed");
+        return false;
+    }
+
+    return true;
 }
 
 bool HookWindowsUIFileExplorerSymbols() {
-    if (IsVersionAtLeast(10, 0, 26100, 0)) {
-        if (!IsVersionAtLeast(10, 0, 26100, 1591)) {
+    if (IsExplorerVersionAtLeast(10, 0, 26100, 0)) {
+        if (!IsExplorerVersionAtLeast(10, 0, 26100, 1591)) {
             return true;
         }
-    } else if (IsVersionAtLeast(10, 0, 22621, 0)) {
-        if (!IsVersionAtLeast(10, 0, 22621, 4111)) {
+    } else if (IsExplorerVersionAtLeast(10, 0, 22621, 0)) {
+        if (!IsExplorerVersionAtLeast(10, 0, 22621, 4111)) {
             return true;
         }
     } else {
@@ -750,7 +781,8 @@ bool HookWindowsUIFileExplorerSymbols() {
         return true;
     }
 
-    HMODULE module = LoadLibrary(L"Windows.UI.FileExplorer.dll");
+    HMODULE module = LoadLibraryEx(L"Windows.UI.FileExplorer.dll", nullptr,
+                                   LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!module) {
         Wh_Log(L"Couldn't load Windows.UI.FileExplorer.dll");
         return false;
@@ -760,47 +792,71 @@ bool HookWindowsUIFileExplorerSymbols() {
     WindhawkUtils::SYMBOL_HOOK hooks[] = {
         {
             {LR"(public: virtual long __cdecl XamlIslandViewAdapter::get_DesiredSizeInPhysicalPixels(struct tagSIZE *))"},
-            (void**)&XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Original,
-            (void*)XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Hook,
+            &XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Original,
+            XamlIslandViewAdapter_get_DesiredSizeInPhysicalPixels_Hook,
             true,
         },
     };
 
-    return HookSymbols(module, hooks, ARRAYSIZE(hooks));
+    if (!HookSymbols(module, hooks, ARRAYSIZE(hooks))) {
+        Wh_Log(L"HookSymbols failed");
+        return false;
+    }
+
+    return true;
 }
 
-bool HookFileExplorerExtensionsSymbols() {
-    WCHAR path[MAX_PATH];
-    if (!GetWindowsDirectory(path, ARRAYSIZE(path))) {
-        Wh_Log(L"GetWindowsDirectory failed");
-        return false;
-    }
-
-    wcscat_s(
-        path, MAX_PATH,
-        LR"(\SystemApps\MicrosoftWindows.Client.FileExp_cw5n1h2txyewy\FileExplorerExtensions.dll)");
-
-    HMODULE module =
-        LoadLibraryEx(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!module) {
-        return false;
-    }
-
+bool HookFileExplorerExtensionsSymbols(HMODULE module) {
     WindhawkUtils::SYMBOL_HOOK fileExplorerExtensionsDllHooks[] = {
         {
             {LR"(public: void __cdecl winrt::FileExplorerExtensions::implementation::NavigationBarControl::OnApplyTemplate(void))"},
-            (void**)&Feature_NavigationBarControl_OnApplyTemplate_Original,
-            (void*)Feature_NavigationBarControl_OnApplyTemplate_Hook,
+            &Feature_NavigationBarControl_OnApplyTemplate_Original,
+            Feature_NavigationBarControl_OnApplyTemplate_Hook,
         },
         {
             {LR"(public: virtual int __cdecl winrt::impl::produce<struct winrt::FileExplorerExtensions::factory_implementation::CommandBarExtension,struct winrt::WindowsUdk::UI::Shell::IFileExplorerCommandBarExtensionStatics>::GetHeight(struct winrt::Windows::Foundation::Size,struct winrt::Windows::Foundation::Size *))"},
-            (void**)&CommandBarExtension_GetHeight_Original,
-            (void*)CommandBarExtension_GetHeight_Hook,
+            &CommandBarExtension_GetHeight_Original,
+            CommandBarExtension_GetHeight_Hook,
         },
     };
 
-    return HookSymbols(module, fileExplorerExtensionsDllHooks,
-                       ARRAYSIZE(fileExplorerExtensionsDllHooks));
+    if (!HookSymbols(module, fileExplorerExtensionsDllHooks,
+                     ARRAYSIZE(fileExplorerExtensionsDllHooks))) {
+        Wh_Log(L"HookSymbols failed");
+        return false;
+    }
+
+    return true;
+}
+
+HMODULE GetFileExplorerExtensionsModuleHandle() {
+    return GetModuleHandle(L"FileExplorerExtensions.dll");
+}
+
+void HandleLoadedModuleIfFileExplorerExtensions(HMODULE module,
+                                                LPCWSTR lpLibFileName) {
+    if (!g_fileExplorerExtensionsLoaded &&
+        GetFileExplorerExtensionsModuleHandle() == module &&
+        !g_fileExplorerExtensionsLoaded.exchange(true)) {
+        Wh_Log(L"Loaded %s", lpLibFileName);
+
+        if (HookFileExplorerExtensionsSymbols(module)) {
+            Wh_ApplyHookOperations();
+        }
+    }
+}
+
+using LoadLibraryExW_t = decltype(&LoadLibraryExW);
+LoadLibraryExW_t LoadLibraryExW_Original;
+HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
+                                   HANDLE hFile,
+                                   DWORD dwFlags) {
+    HMODULE module = LoadLibraryExW_Original(lpLibFileName, hFile, dwFlags);
+    if (module) {
+        HandleLoadedModuleIfFileExplorerExtensions(module, lpLibFileName);
+    }
+
+    return module;
 }
 
 void LoadSettings() {
@@ -825,14 +881,46 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
 
-    if (!HookFileExplorerExtensionsSymbols()) {
-        return FALSE;
+    if (HMODULE fileExplorerExtensionsModule =
+            GetFileExplorerExtensionsModuleHandle()) {
+        g_fileExplorerExtensionsLoaded = true;
+        if (!HookFileExplorerExtensionsSymbols(fileExplorerExtensionsModule)) {
+            return FALSE;
+        }
+    } else {
+        Wh_Log(L"File explorer extensions module not loaded yet");
+
+        HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
+        auto pKernelBaseLoadLibraryExW =
+            (decltype(&LoadLibraryExW))GetProcAddress(kernelBaseModule,
+                                                      "LoadLibraryExW");
+        WindhawkUtils::Wh_SetFunctionHookT(pKernelBaseLoadLibraryExW,
+                                           LoadLibraryExW_Hook,
+                                           &LoadLibraryExW_Original);
     }
 
-    Wh_SetFunctionHook((void*)CoCreateInstance, (void*)CoCreateInstance_Hook,
-                       (void**)&CoCreateInstance_Original);
+    WindhawkUtils::Wh_SetFunctionHookT(CoCreateInstance, CoCreateInstance_Hook,
+                                       &CoCreateInstance_Original);
 
     return TRUE;
+}
+
+void Wh_ModAfterInit() {
+    Wh_Log(L">");
+
+    if (!g_fileExplorerExtensionsLoaded) {
+        if (HMODULE fileExplorerExtensionsModule =
+                GetFileExplorerExtensionsModuleHandle()) {
+            if (!g_fileExplorerExtensionsLoaded.exchange(true)) {
+                Wh_Log(L"Got FileExplorerExtensions.dll");
+
+                if (HookFileExplorerExtensionsSymbols(
+                        fileExplorerExtensionsModule)) {
+                    Wh_ApplyHookOperations();
+                }
+            }
+        }
+    }
 }
 
 void Wh_ModUninit() {
